@@ -1,0 +1,482 @@
+---
+title: "Experiment 2"
+author: "Alexander (Sasha) Pastukhov"
+date: "19 5 2020"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(boot)
+library(brms)
+library(extrafont)
+library(fs)
+library(ggbeeswarm)
+library(knitr)
+library(kableExtra)
+library(tidyverse)
+
+loadfonts(device="win", quiet = TRUE)
+```
+
+```{r Tabula rasa}
+rm(list = ls())
+```
+
+
+## Utility functions
+
+Function that bootstraps a bias-corrected acceleated 95% confidence interval.
+
+```{r bootstrap function}
+bootstrap_mean_CIs <- function(df, target_var, R=2000){
+  sample_mean <- function(data, index){
+    mean(data[index])
+  }
+  
+  boot_dist <- boot(data= df[[target_var]], statistic = sample_mean, R=R)
+  boot_ci <- boot.ci(boot_dist, type="bca")$bca[4:5]
+
+  tibble(Vmean = boot_dist$t0,
+         Vmedian = median(boot_dist$t),
+         Vlower = boot_ci[1], 
+         Vupper = boot_ci[2])
+}
+```
+
+
+Custom plotting theme
+```{r Custom plotting theme}
+theme_ba <- function(){
+  theme(text=element_text(family="Arial"), 
+        axis.text.x = element_text(size = 8, colour = 'black'), 
+        axis.text.y = element_text(size = 8, colour = 'black'), 
+        axis.title.x = element_text(size = 10), 
+        axis.title.y = element_text(size = 10), 
+        panel.grid.minor.x = element_blank(), 
+        panel.grid.minor.y =  element_line(size = 0.24), 
+        axis.ticks = element_line(size = 0.24))
+}
+```
+
+Colors
+```{r colors}
+two_colors <- c("#66c2a5", "#fc8d62")
+two_light_colors <- c("#b2e0d2", "#fdc6b0")
+
+
+prime_probe_colors <- c("#E6444F", "#00457D")
+prime_probe_light_colors <- c("#f2a1a7", "#7fa2be")
+```
+
+
+# Import and Preprocessing
+
+Filename is coded as `Asynchronous Onset - <layout> - <subjectID> - <timestamp>.csv`, where
+
+* `<layout>` is either _Parallel_ (spheres are presented to the left and to the right of fixation) or _Coaxial_ (spheres presented above and below the fixation).
+* `<timestamp>` is in format YYYY-mm-dd-HH-MM-SS. Can be converted to an actual datetime using lubridate::ymd_hms() function.
+
+
+The CSV-file format is the following:
+
+* **Session**: string. Timestamp of the experimental session in format YYYY-mm-dd-HH-MM-SS. Can be converted to an actual datetime using lubridate::ymd_hms() function. Same as in filename.
+* **Participant**: string. Unique participants ID, as in filename.
+* **Block**: int. Block index.
+* **Trial**: int. Trial index.
+* **WhatIsReported": str. Either "probe" (only probe was presented) or "both" (both prime and probe were presented).
+* **StereoStrength**: float. Strength of the stereoscopic depth disambiguation in degreees. 
+* **BiasedSide**: string. Sphere that was disambiguated. For _parallel_ layout it is either _left_ or _right_. For the _coaxial_ it is either _above_ or _below_ the fixation.
+* **RotationBias**: string. Biased direction of rotation, either _left_ or _right_.
+* **ProbeDuration**: float. Duration of the probe.
+* **OnsetDelay**: float. Onset delay before the start of the block in seconds.
+* **ProbeSOA**: float. Stimulus onset asynchrony for the probe display, relative to the onset of the prime.
+* **Percept**: string. Reported percept or event. Can be 
+  * **left**: both spheres (co)rotated to the left
+  * **right**: both spheres (co)rotated to the right
+  * **up**/**down**: Sphere counterrotated. For _parallel_ layout _up_ means that the spheres rotated "into the screen" (the left sphere to the right, the right sphere to the left) and _down_ means that spheres rotated "out of the screen" (the left sphere rotated to the left, the right to the right). For the _coaxial_ layout both are renamed to **counterrotation** after the data is loaded in R.
+  * **unclear**: unclear perception
+* **RT**: float. Response time in seconds.
+
+
+```{r Preprocessing}
+results <- tibble(Layout= c("Parallel", "Coaxial")) %>%
+  # listing all files in folders
+  group_by(Layout) %>%
+  do(tibble(filename= as.character(dir_ls("Data/Experiment 2", glob= stringr::str_c("*Onset*", .$Layout, "*.csv"))))) %>%
+  
+  # 1. loading files one-by-one and merging into the table
+  group_by(Layout, filename) %>%
+  do(read_csv(.$filename, col_types = cols(Session = col_character(),
+                                           Participant = col_character(),
+                                           Block = col_integer(),
+                                           Trial = col_integer(),
+                                           WhatIsReported = col_character(),
+                                           StereoStrength = col_double(),
+                                           BiasedSide = col_character(),
+                                           RotationBias = col_character(),
+                                           ProbeDuration = col_double(),
+                                           OnsetDelay = col_double(),
+                                           ProbeSOA = col_double(),
+                                           Percept = col_character(),
+                                           RT = col_double()))) %>%
+  ungroup() %>%
+  dplyr::select(-filename) %>%
+
+  # 3. Renaming up/down to counter-rotation for "coaxial" layout
+  rowwise() %>%
+  mutate(Percept= ifelse(Layout == "Coaxial" && Percept %in% c("up", "down"), "counterrotation", Percept)) %>%
+  
+  # Rounding probe SOA
+  mutate(OriginalProbeSOA = ProbeSOA,
+         ProbeSOA = round(ProbeSOA, 2)) %>%
+
+  # restoring order 
+  ungroup() %>%
+  arrange(Participant, Session, Block, Trial)
+
+sort(unique(results$ProbeDuration))
+```
+
+## Parallel layout, _prime_ and _probe_ state relative to the biasing cues
+
+```{r parallel layout}
+parallel <- 
+  results %>%
+  ungroup() %>%
+  
+  # parallel layout, reports on both prime and probe
+  filter(Layout == "Parallel", WhatIsReported == "both") %>%
+  
+  # figuring out perceptual states for individual spheres
+  mutate(LeftSphere =  case_when(Percept == "up" ~ "right",
+                                 Percept == "down" ~ "left",
+                                 TRUE ~ Percept), 
+         RightSphere =  case_when(Percept == "up" ~ "left",
+                                  Percept == "down" ~ "right",
+                                  TRUE ~ Percept)) %>%
+    
+  # biased (even if strength is 0) sphere is denoted as Prime, ambiguous as Probe
+  mutate(Prime = ifelse(BiasedSide == "left", LeftSphere, RightSphere), 
+         Probe = ifelse(BiasedSide == "left", RightSphere, LeftSphere)) %>%
+  
+  # figuring out direction opposite to the bias
+  mutate(AntiBias = ifelse(RotationBias == "left", "right", "left"))
+
+
+bias_effect_per_participant <-
+  parallel %>%
+  pivot_longer(cols = c("Prime", "Probe"), names_to = "Sphere", values_to = "State") %>%
+  mutate(InBiasedDirection = State == RotationBias)
+  
+bias_effect <-
+  bias_effect_per_participant %>%
+  group_by(Participant, StereoStrength, ProbeDuration, Sphere) %>%
+  summarise(Pbias = mean(InBiasedDirection)) %>%
+  group_by(StereoStrength, ProbeDuration, Sphere) %>%
+  do(bootstrap_mean_CIs(., "Pbias"))
+```
+
+```{r fitting models}
+set.seed(4694561)
+bias_effect_fits <-
+  bias_effect_per_participant %>%
+  group_by(Sphere) %>%
+  nest()
+
+bias_effect_fit_prototype <- brms::brm(InBiasedDirection ~ StereoStrength * ProbeDuration + ProbeSOA + (1|Participant),
+                                       family = "bernoulli",
+                                       data = bias_effect_fits$data[[1]],
+                                       chains = 0)
+  
+
+bias_effect_fits <-
+  bias_effect_fits %>%
+  mutate(fit = purrr::map(data, ~update(bias_effect_fit_prototype, newdata = ., chains=4, cores=future::availableCores(), save_all_pars=TRUE)))
+
+bias_effect_fits <-
+  bias_effect_fits %>%
+  mutate(fit = purrr::map(fit, ~brms::add_criterion(., "waic")))
+```
+
+```{r}
+predict_using_median <- function(fit, data_for_predictions){
+  terms <- 
+  brms::fixef(fit) %>% 
+  data.frame() %>%
+  rownames_to_column("Term") %>%
+  select(Term, Estimate) %>%
+  tibble::deframe()
+
+  data_for_predictions$Estimate <- boot::inv.logit(terms['Intercept'] + terms['StereoStrength']* data_for_predictions$StereoStrength + terms['ProbeDuration'] * data_for_predictions$ProbeDuration + 
+    terms['ProbeSOA'] * data_for_predictions$ProbeSOA + terms['StereoStrength:ProbeDuration'] * data_for_predictions$StereoStrength * data_for_predictions$ProbeDuration)
+
+  data_for_predictions
+}
+
+data_for_predictions <-
+  expand.grid(StereoStrength = seq(0, 1.0, by=0.05),
+              ProbeDuration = unique(bias_effect_per_participant$ProbeDuration)) %>%
+  mutate(ProbeSOA = median(bias_effect_per_participant$ProbeSOA))
+
+bias_effect_fits <-
+  bias_effect_fits %>%
+  mutate(predictions = purrr::map(fit, ~predict_using_median(., data_for_predictions)))
+         
+predictions <-
+  bias_effect_fits %>%
+  select(Sphere, predictions) %>%
+  unnest(predictions)
+
+save(bias_effect, predictions, bias_effect_fits, file="experiment2.RData")
+```
+
+
+```{r}
+load("experiment2.RData")
+ggplot(data= bias_effect, 
+         aes(x = StereoStrength, 
+             y = Vmedian,
+             color = Sphere, fill=Sphere, group = Sphere, shape=Sphere)) + 
+  geom_line(data = predictions, aes(y=Estimate), size=1) +
+  geom_errorbar(aes(ymin = Vlower, ymax = Vupper), width= 0.05) +
+  geom_point(size= 2.1) +
+  theme_ba() +
+  theme(legend.position = "none") +
+  scale_y_continuous(name="P(sphere rotation = bias)", limits = c(0, 1), breaks = c(0, 0.25, 0.5, 0.75, 1), labels = c("0", "0.25", "0.5", "0.75", "1")) +
+  scale_x_continuous(name="Disambiguation, stereo cues strength (deg)", 
+                     breaks = sort(unique(bias_effect_per_participant$StereoStrength)),
+                     labels = c("0", "0.25", "0.5", "1")) +
+  scale_color_manual(values = prime_probe_colors) + 
+  scale_shape_manual(values = c(21, 22)) +
+  scale_fill_manual(values = prime_probe_light_colors) + 
+  facet_grid(.~ProbeDuration, labeller = labeller(ProbeDuration = function(value){glue::glue("{value} s")}))
+
+
+ggsave('experiment2.pdf', units="cm", device=cairo_pdf, width=12, height=8)
+```
+
+```{r detailed analysis for terms}
+no_stereo_fit_prototype <- brms::brm(InBiasedDirection ~ ProbeDuration + StereoStrength : ProbeDuration + ProbeSOA + (1|Participant),
+                                     family = "bernoulli",
+                                     data = bias_effect_fits$data[[1]],
+                                     chains = 0)
+
+no_duration_fit_prototype <- brms::brm(InBiasedDirection ~ StereoStrength + StereoStrength : ProbeDuration + ProbeSOA + (1|Participant),
+                                       family = "bernoulli",
+                                       data = bias_effect_fits$data[[1]],
+                                       chains = 0)
+
+no_soa_fit_prototype <- brms::brm(InBiasedDirection ~ StereoStrength + ProbeDuration + StereoStrength : ProbeDuration + (1|Participant),
+                                     family = "bernoulli",
+                                     data = bias_effect_fits$data[[1]],
+                                     chains = 0)
+  
+no_interaction_fit_prototype <- brms::brm(InBiasedDirection ~ StereoStrength + ProbeDuration + ProbeSOA + (1|Participant),
+                                          family = "bernoulli",
+                                          data = bias_effect_fits$data[[1]],
+                                          chains = 0)
+
+reduced_models <- list("Stereo Strength" = no_stereo_fit_prototype, 
+                       "Probe Duration" = no_duration_fit_prototype,
+                       "Probe SOA" = no_soa_fit_prototype,
+                       "Strength:Duration" = no_interaction_fit_prototype)
+
+model_summary <- function(fullmodel, modeldata){
+  # fitting reduced models
+  reduced_fits <- purrr::map(reduced_models, ~update(., newdata=modeldata, chains=4, cores=future::availableCores(), save_all_pars=TRUE))
+  reduced_fits <- purrr::map(reduced_fits, ~brms::add_criterion(., "waic"))
+  
+  # comparison via WAIC
+  dwaic <- purrr::map2(reduced_fits, names(reduced_models),
+                      ~brms::loo_compare(fullmodel, .x, criterion="waic") %>%
+                        data.frame() %>%
+                        rownames_to_column("Model") %>%
+                        mutate(elpd_diff = ifelse(Model != "fullmodel", -elpd_diff, elpd_diff)) %>%
+                        filter(elpd_diff != 0) %>%
+                        mutate(Term = .y)  %>%
+                        select(Term, elpd_diff, se_diff))
+  dwaic_df <- bind_rows(dwaic)
+
+  # full model weight (importance of the term)  
+  reduced_model_weight_df <- 
+    purrr::map_df(reduced_fits, ~brms::model_weights(fullmodel, .)) %>%
+    slice(1) %>%
+    pivot_longer(cols = everything(), names_to = "Term", values_to = "Weight") %>%
+    mutate(Weight = round(Weight, 2))
+
+  # Bayes Factor
+  reduced_bf <- 
+    purrr::map_df(reduced_fits, ~brms::bayes_factor(fullmodel, .)$bf) %>% 
+    pivot_longer(cols=everything(), names_to = "Term", values_to = "BF")
+    
+  # Betas
+  term_effects <-
+    fixef(fullmodel) %>% 
+    data.frame() %>%
+    rownames_to_column("Term") %>%
+    filter(Term != "Intercept") %>%
+    mutate_if(is.numeric, round, digits=3) %>%
+    mutate(Term = names(reduced_models))
+  
+  left_join(term_effects, dwaic_df, by="Term") %>% 
+    left_join(reduced_model_weight_df, by="Term") %>%
+    left_join(reduced_bf, by="Term")
+}
+```
+
+
+```{r model 1} 
+set.seed(5945889)
+modelSummary1 <- model_summary(bias_effect_fits$fit[[1]], bias_effect_fits$data[[1]])
+modelSummary1 %>%
+  mutate(elpd_diff = round(elpd_diff, 2),
+         se_diff = round(se_diff, 2), 
+         dWAIC = glue::glue("{elpd_diff}±{se_diff}"),
+         BF = round(BF, 2),
+         `95% CI` = glue::glue("{Q2.5}..{Q97.5}")) %>%
+  select(Term, Estimate, `95% CI`, dWAIC, Weight, BF)
+
+```
+
+```{r model 2} 
+set.seed(6395496)
+modelSummary2 <- model_summary(bias_effect_fits$fit[[2]], bias_effect_fits$data[[2]])
+modelSummary2 %>%
+  mutate(elpd_diff = round(elpd_diff, 2),
+         se_diff = round(se_diff, 2), 
+         dWAIC = glue::glue("{elpd_diff}±{se_diff}"),
+         BF = round(BF, 2),
+         `95% CI` = glue::glue("{Q2.5}..{Q97.5}")) %>%
+  select(Term, Estimate, `95% CI`, dWAIC, Weight, BF)
+  
+```
+
+## Proportion of corotation in direction of bias for both layouts
+```{r}
+corotation_per_participant <-
+  results %>%
+  ungroup() %>%
+  filter(WhatIsReported == "both") %>%
+  mutate(InBiasedDirection = Percept == RotationBias)
+
+corotation_with_bias <-
+  corotation_per_participant %>%
+  group_by(Participant, Layout, StereoStrength, ProbeDuration) %>%
+  mutate(NWithBias = sum(InBiasedDirection),
+         NTotal = n(),
+         PWithBias = NWithBias / NTotal) %>%
+  group_by(Layout, StereoStrength, ProbeDuration) %>%
+  do(bootstrap_mean_CIs(., "PWithBias"))
+```
+
+
+```{r fitting coupling models}
+set.seed(5614694)
+corotation_fits <-
+  corotation_per_participant %>%
+  group_by(Layout) %>%
+  nest()
+
+bias_effect_fit_prototype <- brms::brm(InBiasedDirection ~ StereoStrength * ProbeDuration + ProbeSOA + (1|Participant),
+                                       family = "bernoulli",
+                                       data = corotation_fits$data[[1]],
+                                       chains = 0)
+
+corotation_fits <-
+  corotation_fits %>%
+  mutate(fit = purrr::map(data, ~update(bias_effect_fit_prototype,
+                                        newdata = .,
+                                        chains=4,
+                                        cores=future::availableCores(),
+                                        save_all_pars=TRUE)))
+
+corotation_fits <-
+  corotation_fits %>%
+  mutate(fit = purrr::map(fit, ~brms::add_criterion(., "waic")))
+```
+
+
+```{r}
+predict_using_median <- function(fit, data_for_predictions){
+  terms <- 
+  brms::fixef(fit) %>% 
+  data.frame() %>%
+  rownames_to_column("Term") %>%
+  select(Term, Estimate) %>%
+  tibble::deframe()
+
+  data_for_predictions$Estimate <- boot::inv.logit(terms['Intercept'] + terms['StereoStrength']* data_for_predictions$StereoStrength + terms['ProbeDuration'] * data_for_predictions$ProbeDuration + 
+    terms['ProbeSOA'] * data_for_predictions$ProbeSOA + terms['StereoStrength:ProbeDuration'] * data_for_predictions$StereoStrength * data_for_predictions$ProbeDuration)
+
+  data_for_predictions
+}
+
+data_for_predictions <-
+  expand.grid(StereoStrength = seq(0, 1.0, by=0.05),
+              ProbeDuration = unique(corotation_per_participant$ProbeDuration)) %>%
+  mutate(ProbeSOA = median(corotation_per_participant$ProbeSOA))
+
+corotation_fits <-
+  corotation_fits %>%
+  mutate(predictions = purrr::map(fit, ~predict_using_median(., data_for_predictions)))
+         
+corotation_predictions <-
+  corotation_fits %>%
+  select(Layout, predictions) %>%
+  unnest(predictions)
+
+save(corotation_with_bias, corotation_fits, corotation_predictions, file="experiment2-corotation.RData")
+```
+
+```{r}
+ggplot(data= corotation_with_bias, 
+         aes(x = StereoStrength, 
+             y = Vmedian,
+             color = Layout, fill=Layout, group = Layout, shape=Layout)) + 
+  geom_line(data = corotation_predictions, aes(y=Estimate)) +
+  geom_errorbar(aes(ymin = Vlower, ymax = Vupper), width= 0.05) +
+  geom_point(size= 2.1) +
+  theme_ba() +
+  theme(legend.position = c(0.2, 0.8)) +
+  scale_y_continuous(name="P(sphere rotation = bias)", limits = c(0, 1), breaks = c(0, 0.25, 0.5, 0.75, 1), labels = c("0", "0.25", "0.5", "0.75", "1")) +
+  scale_x_continuous(name="Disambiguation, stereo cues strength (deg)", 
+                     breaks = c(0, 0.25, 0.5, 1),
+                     labels = c("0", "0.25", "0.5", "1")) +
+  scale_shape_manual(values = c(21, 22)) +
+  facet_grid(.~ProbeDuration, labeller = labeller(ProbeDuration = function(value){glue::glue("{value} s")}))
+
+
+ggsave('experiment2-corotation.pdf', units="cm", device=cairo_pdf, width=12, height=8)
+```
+
+### Corotation tables
+
+
+```{r corotation model 1} 
+set.seed(8895945)
+modelSummary1 <- model_summary(corotation_fits$fit[[1]], corotation_fits$data[[1]])
+modelSummary1 %>%
+  mutate(elpd_diff = round(elpd_diff, 2),
+         se_diff = round(se_diff, 2), 
+         dWAIC = glue::glue("{elpd_diff}±{se_diff}"),
+         BF = round(BF, 2),
+         `95% CI` = glue::glue("{Q2.5}..{Q97.5}")) %>%
+  select(Term, Estimate, `95% CI`, dWAIC, Weight, BF)
+```
+
+
+```{r corotation model 2}
+load("experiment2-corotation.RData")
+set.seed(9594588)
+modelSummary2 <- model_summary(corotation_fits$fit[[2]], corotation_fits$data[[2]])
+modelSummary2 %>%
+  mutate(elpd_diff = round(elpd_diff, 2),
+         se_diff = round(se_diff, 2), 
+         dWAIC = glue::glue("{elpd_diff}±{se_diff}"),
+         BF = round(BF, 2),
+         `95% CI` = glue::glue("{Q2.5}..{Q97.5}")) %>%
+  select(Term, Estimate, `95% CI`, dWAIC, Weight, BF)
+```

@@ -1,0 +1,828 @@
+---
+title: "Experiment 1"
+author: "Alexander (Sasha) Pastukhov"
+date: "10 5 2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(boot)
+library(brms)
+library(extrafont)
+library(fs)
+library(ggbeeswarm)
+library(knitr)
+library(kableExtra)
+library(tidyverse)
+
+loadfonts(quiet = TRUE)
+```
+
+```{r Tabula rasa}
+rm(list = ls())
+```
+
+
+## Utility functions
+
+Function that bootstraps a bias-corrected accelerated 95% confidence interval.
+
+```{r bootstrap function}
+bootstrap_mean_CIs <- function(df, target_var, R=2000){
+  sample_mean <- function(data, index){
+    mean(data[index])
+  }
+  
+  boot_dist <- boot(data= df[[target_var]], statistic = sample_mean, R=R)
+  boot_ci <- boot.ci(boot_dist, type="bca")$bca[4:5]
+
+  tibble(Vmean = boot_dist$t0,
+         Vmedian = median(boot_dist$t),
+         Vlower = boot_ci[1], 
+         Vupper = boot_ci[2])
+}
+```
+
+
+Custom plotting theme
+```{r Custom plotting theme}
+theme_ba <- function(){
+  theme(text=element_text(family="Arial"), 
+        axis.text.x = element_text(size = 8, colour = 'black'), 
+        axis.text.y = element_text(size = 8, colour = 'black'), 
+        axis.title.x = element_text(size = 10), 
+        axis.title.y = element_text(size = 10), 
+        panel.grid.minor.x = element_blank(), 
+        panel.grid.minor.y =  element_line(size = 0.24), 
+        axis.ticks = element_line(size = 0.24))
+}
+```
+
+Colors
+```{r colors}
+four_colors <- c("#F8766D", "#7CAE00", "#00BFC4", "#C77CFF")
+five_colors <- c("#000000", four_colors)
+
+four_light_colors <- c("#FBBAB6", "#BDD67F", "#7FDFE1", "#E3BFFE")
+five_light_colors <- c("#7F7F7F", four_light_colors)
+
+
+prime_probe_colors <- c("#E6444F", "#00457D")
+prime_probe_light_colors <- c("#f2a1a7", "#7fa2be")
+```
+
+## Import and Preprocessing
+
+Filename is coded as `Continuous - <layout> - <subjectID> - <timestamp>.csv`, where
+
+* `<layout>` is either _Parallel_ (spheres are presented to the left and to the right of fixation) or _Coaxial_ (spheres presented above and below the fixation).
+* `<timestamp>` is in format YYYY-mm-dd-HH-MM-SS. Can be converted to an actual datetime using lubridate::ymd_hms() function.
+
+The CSV-file format is the following:
+
+* **Session**: string. Timestamp of the experimental session in format YYYY-mm-dd-HH-MM-SS. Can be converted to an actual datetime using lubridate::ymd_hms() function. Same as in filename.
+* **Participant**: string. Unique participants ID, as in filename.
+* **Block**: int. Block index.
+* **OnsetDelay**: float. Onset delay before the start of the block in seconds.
+* **StereoStrength**: float. Strength of the stereoscopic depth disambiguation in degreees. 
+* **BiasedSide**: string. Sphere that was disambiguated. For _parallel_ layout it is either _left_ or _right_. For the _coaxial_ it is either _above_ or _below_ the fixation.
+* **RotationBias**: string. Biased direction of rotation, either _left_ or _right_.
+* **Percept**: string. Reported percept or event. Can be 
+  * **left**: both spheres (co)rotated to the left
+  * **right**: both spheres (co)rotated to the right
+  * **up**/**down**: Sphere counterrotated. For _parallel_ layout _up_ means that the spheres rotated "into the screen" (the left sphere to the right, the right sphere to the left) and _down_ means that spheres rotated "out of the screen" (the left sphere rotated to the left, the right to the right). For the _coaxial_ layout both are renamed to **counterrotation** after the data is loaded in R.
+  * **unclear**: unclear perception
+  * **start**: block start.
+  * **stop**: end of the block. Due to a programming error, this event is added after the data is loaded into R.
+* **Time**: float. Time of the percept report or event in **seconds** relative to the start of the block.
+
+```{r Import}
+results <- 
+  tibble(Layout= c("Parallel", "Coaxial")) %>%
+  
+  # listing all files in folders
+  group_by(Layout) %>%
+  do(tibble(filename= as.character(dir_ls("Data/Experiment 1/", glob= str_c("*Continuous*", .$Layout, "*.csv"))))) %>%
+  
+  # 1. loading files one-by-one and merging into the table
+  group_by(Layout, filename) %>%
+  do(read_csv(.$filename, 
+              col_types = cols(Session = col_character(),
+                               Participant = col_character(),
+                               Block = col_integer(),
+                               OnsetDelay = col_double(),
+                               StereoStrength = col_double(),
+                               BiasedSide = col_character(),
+                               RotationBias = col_character(),
+                               Percept = col_character(),
+                               Time = col_double()))) %>%
+  ungroup() %>%
+  dplyr::select(-filename) %>%
+
+  # 2. adding "stop" event at the end of each block
+  group_by(Session, Block) %>%
+  do(add_row(., Percept = "stop", Time = 60)) %>%
+  ungroup() %>%
+  do(zoo::na.locf(.)) %>%  
+  mutate(BlockDuration = 60) %>%
+
+  # 3. Renaming up/down to counterrotation for "coaxial" layout
+  rowwise() %>%
+  mutate(Percept= ifelse(Layout == "Coaxial" && Percept %in% c("up", "down"), 
+                         "counterrotation", 
+                         Percept)) %>%
+  ungroup() %>%
+
+  # 4. Computing duration of individual perceptual states
+  group_by(Participant, Block) %>%
+  mutate(Duration = lead(Time) - Time) %>%
+  
+  # 5. Additional information about perceptual states 
+  mutate(AntiBias = ifelse(RotationBias == "left", "right", "left")) %>%
+  
+  # 6. Figuring out perceptual states for individual spheres
+  mutate(LeftSphere =  ifelse(Layout == "Parallel", 
+                              case_when(Percept == "up" ~ "right",
+                                        Percept == "down" ~ "left",
+                                        TRUE ~ Percept),
+                              NA), 
+         RightSphere =  ifelse(Layout == "Parallel",
+                               case_when(Percept == "up" ~ "left",
+                                         Percept == "down" ~ "right",
+                                         TRUE ~ Percept),
+                               NA)) %>%
+  
+  # 7. Figuring out who is prime and who is probe
+  mutate(Prime = ifelse(BiasedSide == "left", LeftSphere, RightSphere), 
+         Probe = ifelse(BiasedSide == "left", RightSphere, LeftSphere)) %>%
+  
+  # 8. Marking out whether particular combinations of perceptual states are true
+  mutate(IsClearPercept = Percept %in% c("left", "right", "up", "down", "counterrotation"),
+         IsCoupled = Percept %in% c("left", "right"), 
+         IsBothWith = Percept == RotationBias,
+         IsBothAgainst = Percept == AntiBias,
+         IsPrimeWithProbeAgainst = (Prime == RotationBias) & (Probe == AntiBias),
+         IsPrimeAgainstProbeWith = (Prime == AntiBias) & (Probe == RotationBias)) %>%
+  
+  ungroup() %>%
+  arrange(Layout, Participant, Block, Time)
+```
+
+## Proportion for perceptual coupling states for both coaxial and parallel layouts
+
+Computing proportion.
+
+```{r Both layouts coupling per participant}
+coupling_per_participant <-
+  results %>%
+  
+  # first, computing each coupling per block
+  group_by(Participant, Layout, Block, StereoStrength) %>%
+  
+  summarise(ClearTotal = sum(Duration[IsClearPercept]),
+            `Overall coupling` = sum(Duration[IsCoupled]) / ClearTotal,
+            `Both With` = sum(Duration[IsBothWith]) / ClearTotal,
+            `Both Against` = sum(Duration[IsBothAgainst]) / ClearTotal,
+            `Prime With, Probe Against` = sum(Duration[IsPrimeWithProbeAgainst]) / ClearTotal,
+            `Prime Against, Probe With` = sum(Duration[IsPrimeAgainstProbeWith]) / ClearTotal) %>%
+  select(-ClearTotal) %>%
+  pivot_longer(cols=c("Overall coupling", "Both With", "Both Against", "Prime With, Probe Against", "Prime Against, Probe With"),
+               names_to="Coupling",
+               values_to = "Pblock") %>%
+  ungroup() %>%
+  mutate(Coupling = as.factor(Coupling),
+         Coupling = fct_relevel(Coupling, "Overall coupling", "Both With", "Both Against", "Prime With, Probe Against", "Prime Against, Probe With")) %>%
+  na.omit() %>%
+  
+  # then, averaging across blocks
+  group_by(Layout, Participant, StereoStrength, Coupling) %>%
+  summarise(P = mean(Pblock, na.rm = TRUE)) %>%
+
+  # Beta chokes on P of exactly 0 or of exactly 1
+  mutate(Punscaled = P,
+         P = P * 0.99999 + 0.000005) %>%
+  
+  # Adding explicit variable for stereo presense
+  mutate(StereoOn = StereoStrength > 0)
+```
+
+Bootstrapping group averages for plotting
+
+```{r coupling plot}
+coupling_bootstrapped <-
+  coupling_per_participant %>%
+  # filter(Coupling %in% c("Both With", "Both Against", "Prime Against, Probe With")) %>%
+  group_by(Coupling, Layout, StereoStrength) %>%
+  do(bootstrap_mean_CIs(., "P"))
+```
+
+Fitting each coupling with a beta proportion model
+
+```{r fit coupling}
+set.seed(22706408)
+# nesting each layout x coupling combination into a separate table
+coupling_fits <-
+  coupling_per_participant %>%
+  group_by(Layout, Coupling) %>%
+  tidyr::nest()
+
+
+# running model on first coupling (whatever it is), so we can "update" it for the real loop and avoid recompilation
+prototype_fit <- brms::brm(P ~ StereoOn + StereoStrength + (1|Participant),
+                           family = Beta(),
+                           chains = 0,
+                           cores=future::availableCores(),
+                           data = coupling_fits$data[[1]])
+
+no_stereoon_prorotype_fit <- update(prototype_fit, formula. = ~ . -StereoOn, chains=0)
+no_stereostrength_prorotype_fit <- update(prototype_fit, formula. = ~ . -StereoStrength, chains=0)
+
+# fitting all conditions
+coupling_fits <-
+  coupling_fits %>%
+  mutate(fit = purrr::map(data, ~update(prototype_fit, newdata= ., chains=4, save_all_pars=TRUE, cores=future::availableCores())))
+
+# fitting reduced models without either StereoOn or without StereoStength
+coupling_fits <-
+  coupling_fits %>%
+  mutate(no_stereoon_fit = purrr::map(data, ~update(no_stereoon_prorotype_fit, newdata=., chains=4, save_all_pars=TRUE, cores=future::availableCores())),
+         no_stereostrength_fit = purrr::map(data, ~update(no_stereostrength_prorotype_fit, newdata=., save_all_pars=TRUE, chains=4, cores=future::availableCores())))
+
+# adding LOO criterion to the models
+coupling_fits <-
+  coupling_fits %>%
+  mutate(fit = purrr::map(fit, ~brms::add_criterion(., "waic", overwrite=TRUE, reloo = TRUE)),
+         no_stereoon_fit = purrr::map(no_stereoon_fit, ~brms::add_criterion(., "waic", overwrite=TRUE, reloo = TRUE)),
+         no_stereostrength_fit = purrr::map(no_stereostrength_fit, ~brms::add_criterion(., "waic", overwrite=TRUE, reloo = TRUE)))
+
+# extracting beta weights
+coupling_fits <-
+  coupling_fits %>%
+  mutate(Beta = purrr::map(fit, 
+                           ~brms::fixef(.) %>%
+                             data.frame() %>%
+                             rownames_to_column("Term") %>%
+                             filter(Term != "Intercept") %>%
+                             mutate(Term = stringr::str_replace_all(Term, c("StereoOnTRUE"="Stereo", "StereoStrength"="Strength"))) %>%
+                             mutate_if(is.numeric, round, digits=2) %>%
+                             mutate(`95% CI` = stringr::str_c(as.character(Q2.5), "..", as.character(Q97.5))) %>%
+                             select(Term, Estimate, `95% CI`)))
+
+# comparing full and a reduced model
+compare_models <- function(full_model, reduced_model, term){
+  elpd <- 
+    brms::loo_compare(full_model, reduced_model,  criterion = "waic") %>%
+    data.frame() %>%
+    tibble::rownames_to_column("Model") %>%
+    select(Model, elpd_diff, se_diff) %>%
+    mutate(elpd_diff = ifelse(Model == "full_model", -elpd_diff, elpd_diff)) %>%
+    filter(elpd_diff!=0) %>%
+    mutate_if(is.numeric, round, digits=2) %>%
+    mutate(elpd = stringr::str_c(as.character(elpd_diff), "±", as.character(se_diff))) %>%
+    pull(elpd)
+  
+  model_weight <- 
+    brms::model_weights(full_model, reduced_model, weights = "waic")["full_model"]
+  
+  bf <- brms::bayes_factor(full_model, reduced_model, silent = TRUE)$bf
+    
+  
+  tibble(Term = term, dLOO = elpd, Weight = round(model_weight, 2), BF = bf)
+}
+
+coupling_fits <-
+  coupling_fits %>%
+  mutate(compare_stereoon_fit = purrr::map2(fit, no_stereoon_fit, ~compare_models(.x, .y, "Stereo")), 
+         compare_stereostrength_fit = purrr::map2(fit, no_stereostrength_fit, ~compare_models(.x, .y, "Strength")))
+
+```
+
+
+```{r}
+# compiling a table
+coupling_fits %>%
+  mutate(comparison = purrr::map2(compare_stereoon_fit, compare_stereostrength_fit, ~bind_rows(.x, .y))) %>%
+  mutate(comparison = purrr::map2(comparison, Beta, ~left_join(.x, .y, by="Term"))) %>%
+  select(Layout, Coupling, comparison) %>%
+  unnest(comparison) %>%
+  arrange(Layout, Coupling, Term) %>%
+  mutate(BF = sprintf('%.2g', BF)) %>%
+  select(Layout, Coupling, Estimate, `95% CI`, dLOO, Weight, BF)
+```
+
+Generating predictions via median parameters
+```{r}
+predict_using_median <- function(fit, data_for_predictions){
+  terms <- 
+  brms::fixef(fit) %>% 
+  data.frame() %>%
+  rownames_to_column("Term") %>%
+  select(Term, Estimate) %>%
+  tibble::deframe()
+
+  data_for_predictions$Estimate <- boot::inv.logit(terms['Intercept'] + 
+                                                   terms['StereoOnTRUE'] * data_for_predictions$StereoOn + 
+                                                   terms['StereoStrength'] * data_for_predictions$StereoStrength)
+  data_for_predictions
+}
+
+data_25_100 <-
+  tibble(StereoStrength = seq(0.25, 1.0, by=0.005),
+         StereoOn = TRUE)
+data_0 <- 
+  tibble(StereoStrength = 0,
+         StereoOn = FALSE)
+
+
+predictions_25_100 <-
+  coupling_fits %>%
+  mutate(predictions_25_100 = purrr::map(fit, ~predict_using_median(., data_25_100))) %>%
+  select(Layout, Coupling, predictions_25_100) %>%
+  unnest(predictions_25_100)
+
+
+predictions_0 <-
+  coupling_fits %>%
+  mutate(predictions_0 = purrr::map(fit, ~predict_using_median(., data_0))) %>%
+  select(Layout, Coupling, predictions_0) %>%
+  unnest(predictions_0)
+
+
+predictions_around_0 <-
+  bind_rows(predictions_0 %>% mutate(StereoStrength = -0.05),
+            predictions_0 %>% mutate(StereoStrength =  0.05))
+```
+
+
+Generating predictions
+```{r coupling predictions, eval=FALSE, include=FALSE}
+data_25_100 <-
+  tibble(StereoStrength = seq(0.25, 1.0, by=0.005),
+         StereoOn = TRUE)
+
+data_0 <- 
+  tibble(StereoStrength = 0,
+         StereoOn = FALSE)
+
+coupling_fits <-
+  coupling_fits %>%
+  mutate(predictions_25_100 = purrr::map(fit, ~bind_cols(data_25_100, 
+                                                         tibble(Estimate = predict(., newdata = data_25_100, re_formula = NA, summary = TRUE)[, 1]))),
+         predictions_0 = purrr::map(fit, ~bind_cols(data_0, 
+                                                    tibble(Estimate = predict(., newdata = data_0, re_formula = NA, summary = TRUE)[, 1]))))
+
+predictions_25_100 <-
+  coupling_fits %>%
+  select(Layout, Coupling, predictions_25_100) %>%
+  unnest(predictions_25_100)
+
+predictions_0 <-
+  coupling_fits %>%
+  select(Layout, Coupling, predictions_0) %>%
+  unnest(predictions_0)
+
+predictions_around_0 <-
+  bind_rows(predictions_0 %>% mutate(StereoStrength = -0.05),
+            predictions_0 %>% mutate(StereoStrength =  0.05))
+
+
+save(coupling_bootstrapped, predictions_25_100, predictions_around_0, file = "exp1-dualstates.RData")
+```
+
+### Parallel layout
+
+```{r plot coupling parallel layout}
+load("exp1-dualstates.RData")
+ggplot(data= coupling_bootstrapped %>% filter(Layout=="Parallel"), #Coupling != "Prime With, Probe Against"),
+       aes(x = StereoStrength,
+           y = Vmedian,
+           color = Coupling, shape = Coupling,
+           group = interaction(Layout, Coupling))) + 
+  
+  geom_hline(yintercept = 0.5, color="darkgray") +
+  # predictions
+  geom_line(data=predictions_25_100 %>% filter(Layout=="Parallel"),#, Coupling != "Prime With, Probe Against"),
+            aes(y=Estimate)) +
+  geom_line(data=predictions_around_0 %>% filter(Layout=="Parallel"), #, Coupling != "Prime With, Probe Against"),
+            aes(y=Estimate)) +
+  
+  # actual data
+  geom_errorbar(aes(ymin = Vlower, ymax = Vupper), width= 0.05, linetype = "solid", size = 0.25) +
+  geom_point(size= 2.1, aes(fill=Coupling)) +
+  scale_x_continuous(name ="Disambiguation, stereo cues strength (deg)", breaks = c(0, 0.25, 0.5, 1), labels = c("0", "0.25", "0.5", "1")) +
+  scale_y_continuous(name="Proportion of dual-state reports", limits = c(0, 1), breaks = c(0, 0.25, 0.5, 0.75, 1), labels = c("0", "0.25", "0.5", "0.75", "1")) +
+  scale_color_manual(values = five_colors) +
+  scale_fill_manual(values = five_light_colors) +
+  scale_shape_manual(values = c(21, 22, 23, 24, 25)) +
+  # labs(title="Parallel layout") +
+  theme_ba() +
+  theme(legend.position = "none")
+
+ggsave("experiment1-coupling.pdf", units="cm", device=cairo_pdf, width=8, height=8)
+```
+
+### Pariwise comparison between _Both Against_ and _Prime Against, Probe With_
+
+In these to cases, _prime_ rotates against the bias but is either accompanied by the fully ambiguous _probe_ (_Both Against_) or does it alone (_Prime Against, Probe With_). If two states are independent, these two cases should occur equally often.
+
+```{r prime with or without probe against bias}
+set.seed(5849829)
+
+prime_against_bias <-
+  coupling_per_participant %>%
+  filter(Layout == "Parallel", Coupling %in% c("Both Against", "Prime Against, Probe With")) %>%
+  mutate(ProbeAgainstBias = Coupling == "Both Against") %>%
+  group_by(StereoStrength) %>%
+  nest()
+
+prime_against_bias_fit_prototype <- brms::brm(P ~ ProbeAgainstBias + (1|Participant),
+                                              family = Beta(),
+                                              save_all_pars = TRUE,
+                                              data = prime_against_bias$data[[1]],
+                                              cores = future::availableCores())
+
+no_probe_fit_prototype <- brms::brm(P ~ (1|Participant),
+                                        family = Beta(),
+                                        save_all_pars = TRUE,
+                                        data = prime_against_bias$data[[1]],
+                                        cores = future::availableCores())
+
+prime_against_bias <-
+  prime_against_bias %>%
+  mutate(fit = purrr::map(data, ~update(prime_against_bias_fit_prototype, newdata=., cores = future::availableCores())))
+
+prime_against_bias <-
+  prime_against_bias %>%
+  mutate(no_probe_fit = purrr::map(data, ~update(no_probe_fit_prototype, newdata=., cores = future::availableCores())))
+
+# extracting beta weights
+prime_against_bias <-
+  prime_against_bias %>%
+  mutate(Beta = purrr::map(fit, 
+                           ~brms::fixef(.) %>%
+                             data.frame() %>%
+                             rownames_to_column("Term") %>%
+                             filter(Term != "Intercept") %>%
+                             mutate_if(is.numeric, round, digits=2) %>%
+                             mutate(`95% CI` = stringr::str_c(as.character(Q2.5), "..", as.character(Q97.5))) %>%
+                             select(Estimate, `95% CI`)))
+
+
+prime_against_bias <-
+  prime_against_bias %>%
+  mutate(fit = purrr::map(fit, ~brms::add_criterion(., "waic", overwrite=TRUE, reloo = TRUE)),
+         no_probe_fit = purrr::map(no_probe_fit, ~brms::add_criterion(., "waic", overwrite=TRUE, reloo = TRUE))) %>%
+  mutate(comparison = purrr::map2(fit, no_probe_fit, ~compare_models(.x, .y, "ProbeAgainstBias")))
+
+# compiling a table
+prime_against_bias %>%
+  mutate(overall_summary = purrr::map2(Beta, comparison, ~bind_cols(.x, .y,))) %>%
+  select(StereoStrength, overall_summary) %>%
+  unnest(overall_summary) %>%
+  select(-Term) %>%
+  mutate(BF = sprintf('%.2g', BF))
+```
+
+### Initial state
+
+```{r probability of initial corotation}
+initial_state <-
+  results %>%
+  filter(IsClearPercept) %>%
+
+  # first percept in each block
+  group_by(Participant, Layout, Block, StereoStrength) %>%
+  slice(1) %>%
+  group_by(Participant, Layout, StereoStrength) %>%
+  summarise(Ncorotation = sum(IsCoupled),
+            Ntotal = n(),
+            Pcorotation = Ncorotation / Ntotal)
+
+ggplot(initial_state, aes(x = as.factor(StereoStrength), group = StereoStrength, y=Pcorotation)) + 
+  geom_boxplot(outlier.shape = NA) + 
+  geom_quasirandom(groupOnX=TRUE, method="tukeyDense") + 
+  facet_grid(.~Layout)
+```
+
+### Transition probabilities
+
+```{r transition probabilities}
+parallel_transitions <-
+  results %>%
+  filter(Layout == "Parallel", Percept != "start", Percept != "stop") %>%
+  mutate(Coupling = case_when(IsBothWith ~ "Both With",
+                              IsBothAgainst ~ "Both Against",
+                              IsPrimeWithProbeAgainst ~ "Prime With, Probe Against",
+                              IsPrimeAgainstProbeWith ~ "Prime Against, Probe With"),
+         Coupling = factor(Coupling, levels = c("Both With", "Both Against", "Prime With, Probe Against", "Prime Against, Probe With"))) %>%
+  drop_na(Coupling) %>%
+  group_by(Participant, Session, Block, StereoStrength) %>%
+  mutate(NextCoupling= lead(Coupling)) %>%
+  group_by(Participant, Session, Block, StereoStrength, Coupling, NextCoupling) %>%
+  drop_na(NextCoupling) %>%
+  summarise(TransitionCount  = n()) %>%
+  tidyr::complete(Coupling, NextCoupling) %>%
+  group_by(Participant, StereoStrength, Coupling, NextCoupling) %>%
+  summarize(TransitionCount = sum(TransitionCount))
+
+
+ggplot(parallel_transitions %>% filter(Coupling != NextCoupling), 
+       aes(x = NextCoupling, y = TransitionCount)) + 
+  geom_boxplot(outlier.shape = NA) +
+  geom_quasirandom(method="tukeyDense", groupOnX = TRUE) + 
+  facet_grid(Coupling ~ StereoStrength) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  theme_ba()
+```
+
+```{r transitions formal analysis}
+transitions_fit_prototype <- brms::brm(TransitionCount ~ NextCoupling + StereoStrength + (1|Participant), 
+                                       family = "poisson", data= parallel_transitions, chains= 0)
+
+transitions_test <-
+  parallel_transitions %>%
+  filter(Coupling != NextCoupling) %>%
+  group_by(Coupling) %>%
+  nest() %>%
+  mutate(fit = purrr::map(data, ~update(transitions_fit_prototype, newdata = ., chains=4, cores=future::availableCores())))
+  
+
+posterior <- brms::posterior_samples(transitions_test$fit[[1]])[, 1:3]
+brms::fixef(transitions_test$fit[[4]])
+
+transitions_test <-
+  transitions_test %>%
+  mutate(terms = purrr::map(fit, ~brms::fixef(.) %>% data.frame() %>% rownames_to_column("Term") %>% mutate(Term = stringr::str_remove_all(Term, "NextCoupling")))) %>%
+  mutate(IntercepTerm = purrr::map(Coupling, ~setdiff(levels(.), c(as.character(.)))[1])) %>%
+  mutate(terms = purrr::map2(terms, IntercepTerm, ~mutate(.x, Term = ifelse(Term == "Intercept", stringr::str_c("Intercept: ", .y), Term))))
+
+
+transitions_test %>%
+  select(Coupling, terms) %>%
+  unnest(terms) %>%
+  knitr::kable() %>%
+  kableExtra::kable_styling(bootstrap_options = c("striped")) %>%
+  kableExtra::collapse_rows(columns = 1, valign = "top")
+```
+
+
+```{r transitions formal analysis per coupling and stereo strength}
+transitions_nc_fit_prototype <- brms::brm(TransitionCount ~ NextCoupling + (1|Participant), 
+                                          family = "poisson", data= parallel_transitions, chains= 0)
+
+transitions_nc_test <-
+  parallel_transitions %>%
+  filter(Coupling != NextCoupling) %>%
+  group_by(Coupling, StereoStrength) %>%
+  nest() %>%
+  mutate(fit = purrr::map(data, ~update(transitions_nc_fit_prototype, newdata = ., chains=4, cores=future::availableCores())))
+  
+
+transitions_nc_test <-
+  transitions_nc_test %>%
+  mutate(terms = purrr::map(fit, ~brms::fixef(.) %>% data.frame() %>% rownames_to_column("Term") %>% mutate(Term = stringr::str_remove_all(Term, "NextCoupling")))) %>%
+  mutate(IntercepTerm = purrr::map(Coupling, ~setdiff(levels(.), c(as.character(.)))[1])) %>%
+  mutate(terms = purrr::map2(terms, IntercepTerm, ~mutate(.x, Term = ifelse(Term == "Intercept", stringr::str_c("Intercept: ", .y), Term))))
+
+
+transitions_nc_test %>%
+  select(Coupling, StereoStrength, terms) %>%
+  unnest(terms) %>%
+  knitr::kable() %>%
+  kableExtra::kable_styling(bootstrap_options = c("striped")) %>%
+  kableExtra::collapse_rows(columns = 1:2, valign = "top")
+```
+
+### Prime and Probe states for the parallel layout
+
+Compute proportion of time each sphere (prime or probe) were seen rotation in the direction of the bias
+
+```{r prime probe preprocessig}
+prime_probe <-
+  results %>%
+  # parallel only, clear percepts only
+  dplyr::filter(Layout == "Parallel", IsClearPercept) %>%
+  
+  # pivot table so that the sphere type (prime/probe) is now a factor
+  dplyr::select(Participant, Block, StereoStrength, RotationBias, Prime, Probe, Duration) %>%
+  tidyr::pivot_longer(cols=c("Prime", "Probe"), names_to = "Sphere", values_to = "Percept") %>%
+  dplyr::arrange(Participant, Block, StereoStrength, Sphere) %>%
+  
+  # mark out when sphere is rotating in the direction of the biasing cues 
+  dplyr::mutate(IsCongruent = Percept == RotationBias) %>%
+  
+  # compute proportion of time each sphere rotates in the bias direction PER BLOCK
+  dplyr::group_by(Participant, Block, StereoStrength, Sphere) %>%
+  dplyr::summarise(Pblock = sum(Duration[IsCongruent]) / sum(Duration)) %>%
+
+  # compute average proportion across all blocks
+  dplyr::group_by(Participant, StereoStrength, Sphere) %>%
+  dplyr::summarise(Punscaled = mean(Pblock)) %>%
+  
+  # scaling P for beta regression
+  dplyr::mutate(P = Punscaled * 0.99999 + 0.000005) %>%
+  
+  # Adding explicit variable for stereo presense
+  mutate(StereoOn = StereoStrength > 0)
+```
+
+Statistical modelling for prime and probe.
+
+```{r prime probe model}
+prime_probe_fits <-
+  prime_probe %>%
+  group_by(Sphere) %>%
+  tidyr::nest() %>%
+  
+  # fitting 
+  dplyr::mutate(fit = purrr::map(data, ~update(prototype_fit, newdata= ., cores=future::availableCores(), save_all_pars=TRUE)))
+
+# fitting reduced models without either StereoOn or without StereoStength
+prime_probe_fits <-
+  prime_probe_fits %>%
+  mutate(no_stereoon_fit = purrr::map(data, ~update(no_stereoon_prorotype_fit, newdata=., formula. = ~ . -StereoOn, cores=future::availableCores(), save_all_pars=TRUE)),
+         no_stereostrength_fit = purrr::map(data, ~update(no_stereostrength_prorotype_fit, newdata=., formula. = ~ . -StereoStrength, cores=future::availableCores(), save_all_pars=TRUE)))
+
+# adding LOO criterion to the models
+prime_probe_fits <-
+  prime_probe_fits %>%
+  mutate(fit = purrr::map(fit, ~brms::add_criterion(., "waic", overwrite=TRUE, reloo = TRUE)),
+         no_stereoon_fit = purrr::map(no_stereoon_fit, ~brms::add_criterion(., "waic", overwrite=TRUE, reloo = TRUE)),
+         no_stereostrength_fit = purrr::map(no_stereostrength_fit, ~brms::add_criterion(., "waic", overwrite=TRUE, reloo = TRUE)))
+
+# extracting beta weights
+prime_probe_fits <-
+  prime_probe_fits %>%
+  mutate(Beta = purrr::map(fit, 
+                           ~brms::fixef(.) %>%
+                             data.frame() %>%
+                             rownames_to_column("Term") %>%
+                             filter(Term != "Intercept") %>%
+                             mutate(Term = stringr::str_replace_all(Term, c("StereoOnTRUE"="Stereo", "StereoStrength"="Strength"))) %>%
+                             mutate_if(is.numeric, round, digits=2) %>%
+                             mutate(`95% CI` = stringr::str_c(as.character(Q2.5), "..", as.character(Q97.5))) %>%
+                             select(Term, Estimate, `95% CI`)))
+
+# compare models
+prime_probe_fits <-
+  prime_probe_fits %>%
+  mutate(compare_stereoon_fit = purrr::map2(fit, no_stereoon_fit, ~compare_models(.x, .y, "Stereo")), 
+         compare_stereostrength_fit = purrr::map2(fit, no_stereostrength_fit, ~compare_models(.x, .y, "Strength")))
+
+# compiling a table
+prime_probe_fits %>%
+  mutate(comparison = purrr::map2(compare_stereoon_fit, compare_stereostrength_fit, ~bind_rows(.x, .y))) %>%
+  mutate(comparison = purrr::map2(comparison, Beta, ~left_join(.x, .y, by="Term"))) %>%
+  select(Sphere, comparison) %>%
+  unnest(comparison) %>%
+  arrange(Sphere, Term) %>%
+  select(Sphere, Term, Estimate, `95% CI`, dLOO, Weight, BF)
+```
+Generating predictions via median parameters
+```{r}
+predict_using_median <- function(fit, data_for_predictions){
+  terms <- 
+  brms::fixef(fit) %>% 
+  data.frame() %>%
+  rownames_to_column("Term") %>%
+  select(Term, Estimate) %>%
+  tibble::deframe()
+
+  data_for_predictions$Estimate <- boot::inv.logit(terms['Intercept'] + 
+                                                   terms['StereoOnTRUE'] * data_for_predictions$StereoOn + 
+                                                   terms['StereoStrength'] * data_for_predictions$StereoStrength)
+  data_for_predictions
+}
+
+data_25_100 <-
+  tibble(StereoStrength = seq(0.25, 1.0, by=0.005),
+         StereoOn = TRUE)
+data_0 <- 
+  tibble(StereoStrength = 0,
+         StereoOn = FALSE)
+
+prime_probe_25_100 <-
+  prime_probe_fits %>%
+  mutate(prime_probe_25_100 = purrr::map(fit, ~predict_using_median(., data_25_100))) %>%
+  select(Sphere, prime_probe_25_100) %>%
+  unnest(prime_probe_25_100)
+
+
+prime_probe_0 <-
+  prime_probe_fits %>%
+  mutate(prime_probe_0 = purrr::map(fit, ~predict_using_median(., data_0))) %>%
+  select(Sphere, prime_probe_0) %>%
+  unnest(prime_probe_0)
+
+
+prime_probe_around_0 <-
+  bind_rows(prime_probe_0 %>% mutate(StereoStrength = -0.05),
+            prime_probe_0 %>% mutate(StereoStrength =  0.05))
+```
+
+Generating predictions
+```{r prime probe predictions, eval=FALSE, include=FALSE}
+prime_probe_fits <-
+  prime_probe_fits %>%
+  mutate(predictions_25_100 = purrr::map(fit, ~bind_cols(data_25_100, 
+                                                         tibble(Estimate = predict(., newdata = data_25_100, re_formula = NA, summary = TRUE)[, 1]))),
+         predictions_0 = purrr::map(fit, ~bind_cols(data_0, 
+                                                    tibble(Estimate = predict(., newdata = data_0, re_formula = NA, summary = TRUE)[, 1]))))
+
+prime_probe_25_100 <-
+  prime_probe_fits %>%
+  select(Sphere, predictions_25_100) %>%
+  unnest(predictions_25_100)
+
+prime_probe_0 <-
+  prime_probe_fits %>%
+  select(Sphere, predictions_0) %>%
+  unnest(predictions_0)
+
+prime_probe_around_0 <-
+  bind_rows(prime_probe_0 %>% mutate(StereoStrength = -0.05),
+            prime_probe_0 %>% mutate(StereoStrength =  0.05))
+```
+
+Bootstrap group averages
+
+```{r prime probe bootstrap}
+prime_probe_bootstrapped <-
+  prime_probe %>%
+  group_by(Sphere, StereoStrength) %>%
+  do(bootstrap_mean_CIs(., "P"))
+
+save(prime_probe_bootstrapped, prime_probe, prime_probe_fits, prime_probe_25_100, prime_probe_0, file="exp1-spheres.RData")
+
+```
+
+```{r}
+(prime_probe_fits$fit[[1]])
+
+```
+
+
+Plotting prime and probe dependence on bias and stereo strength
+```{r prime probe plot}
+load("exp1-spheres.RData")
+
+ggplot(data= prime_probe_bootstrapped,
+       aes(x = StereoStrength,
+           y = Vmedian,
+           color = Sphere, shape = Sphere)) + 
+  
+  # predictions
+  geom_line(data=prime_probe_25_100,
+            aes(y=Estimate)) +
+  geom_line(data=prime_probe_around_0,
+            aes(y=Estimate)) +
+  
+  # actual data
+  geom_errorbar(aes(ymin = Vlower, ymax = Vupper), width= 0.05, linetype = "solid", size = 0.25) +
+  geom_point(size= 2.1, aes(fill=Sphere)) +
+  geom_hline(yintercept = 0.5, color="white") +
+  scale_x_continuous(name="Disambiguation, stereo cues strength (deg)", breaks = c(0, 0.25, 0.5, 1), labels = c("0", "0.25", "0.5", "1")) +
+  # scale_y_continuous(name="P(rotation=bias)", limits = c(0, 1)) +
+  scale_y_continuous(name="P(sphere rotation = bias)", limits = c(0, 1), breaks = c(0, 0.25, 0.5, 0.75, 1), labels = c("0", "0.25", "0.5", "0.75", "1")) +
+  scale_shape_manual(values = c(21, 22)) +
+  scale_color_manual(values = prime_probe_colors) +
+  scale_fill_manual(values = prime_probe_light_colors) +
+  theme(legend.position = "none") +
+  theme_ba()
+
+ggsave("experiment1-prime-probe.pdf", units="cm", device=cairo_pdf, width=7, height=6)
+```
+
+
+### Coaxial layout
+
+```{r plot coupling coaxial layout}
+ggplot(data= coupling_bootstrapped %>% filter(Layout=="Coaxial"), #Coupling != "Prime With, Probe Against"),
+       aes(x = StereoStrength,
+           y = Vmedian,
+           color = Coupling, shape = Coupling,
+           group = interaction(Layout, Coupling))) + 
+  
+  geom_hline(yintercept = 0.5, color="darkgray") +
+  # predictions
+  geom_line(data=predictions_25_100 %>% filter(Layout=="Coaxial"),#, Coupling != "Prime With, Probe Against"),
+            aes(y=Estimate)) +
+  geom_line(data=predictions_around_0 %>% filter(Layout=="Coaxial"), #, Coupling != "Prime With, Probe Against"),
+            aes(y=Estimate)) +
+  
+  # actual data
+  geom_errorbar(aes(ymin = Vlower, ymax = Vupper), width= 0.05, linetype = "solid", size = 0.25) +
+  geom_point(size= 2.1, aes(fill=Coupling)) +
+  scale_x_continuous(name ="Disambiguation, stereo cues strength (deg)", breaks = c(0, 0.25, 0.5, 1), labels = c("0", "0.25", "0.5", "1")) +
+  scale_y_continuous(name="Proportion of dual-state reports", limits = c(0, 1), breaks = c(0, 0.25, 0.5, 0.75, 1), labels = c("0", "0.25", "0.5", "0.75", "1")) +
+  scale_color_manual(values = five_colors) +
+  scale_fill_manual(values = five_light_colors) +
+  scale_shape_manual(values = c(21, 22, 23, 24, 25)) +
+  # labs(title="Parallel layout") +
+  theme_ba() +
+  theme(legend.position = "none")
+
+ggsave("experiment1-coaxial-coupling.pdf", units="cm", device=cairo_pdf, width=8, height=8)
+```

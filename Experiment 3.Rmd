@@ -1,0 +1,785 @@
+---
+title: "Experiment 3"
+author: "Alexander (Sasha) Pastukhov"
+date: "20 5 2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(binom)
+library(boot)
+library(bridgesampling)
+library(extrafont)
+library(fs)
+library(knitr)
+library(kableExtra)
+library(loo)
+library(patchwork)
+library(rstan)
+library(tidyverse)
+
+extrafont::loadfonts(quiet = TRUE)
+```
+
+```{r Tabula rasa} 
+rm(list=ls())
+```
+
+
+Custom plotting theme
+```{r Custom plotting theme}
+theme_ba <- function(){
+  theme(text=element_text(family="Arial"), 
+        axis.text.x = element_text(size = 8, colour = 'black'), 
+        axis.text.y = element_text(size = 8, colour = 'black'), 
+        axis.title.x = element_text(size = 10), 
+        axis.title.y = element_text(size = 10), 
+        panel.grid.minor.x = element_blank(), 
+        panel.grid.minor.y =  element_line(size = 0.24), 
+        axis.ticks = element_line(size = 0.24))
+}
+```
+
+
+Colors
+```{r colors}
+three_colors <- c("#f8766d", "#00bfc4", "#97bf0d")
+three_light_colors <- c("#f2a1a7", "#7fa2be", "#cbdf86")
+```
+
+## Importing and preprocessing
+
+```{r import}
+reports <- 
+  tibble(filename = as.character(fs::dir_ls(path="Data/Experiment 3", glob="*timing*.csv"))) %>%
+  rowwise() %>%
+  do(read_csv(.$filename, 
+              col_types = cols(Participant = col_character(),
+                               Session = col_character(),
+                               Block = col_integer(),
+                               Trial = col_integer(),
+                               OnsetDelay = col_double(),
+                               ProbeLocation = col_character(),
+                               WhatIsReported = col_character(),
+                               Condition = col_character(),
+                               TriggerTime = col_integer(),
+                               ProbeSOA = col_integer(),
+                               PrimeDirection = col_character(),
+                               Response = col_character(),
+                               RT = col_double()))) %>%
+  mutate(ProbeSOA = ProbeSOA * 10)
+
+all_dual_reports <-
+  reports %>%
+  filter(WhatIsReported == "both") %>%
+  
+  # final direction rotation of the prime
+  rowwise() %>%
+  mutate(Prime = case_when(Condition %in% c("ambiguous-switch", "biased-switch") ~ ifelse(PrimeDirection == "right", "left", "right"),
+                           Condition == "ambiguous-stable" ~ PrimeDirection)) %>%
+  mutate(IsCaptured = Response == Prime) %>%
+  ungroup() 
+
+# Picking only participants with enough data
+
+data_counts <-  
+  all_dual_reports %>%
+  filter(Condition != "ambiguous-stable") %>%
+  group_by(Participant, ProbeSOA, Condition) %>%
+  summarise(Ncaptured = sum(IsCaptured), 
+            Ntotal = n(),
+            Pcapture = Ncaptured / Ntotal) %>%
+  group_by(Participant) %>%
+  summarise(MinTotal = min(Ntotal),
+            MedianPcapture = median(Pcapture)) %>%
+  ungroup() %>%
+  arrange(desc(MinTotal)) %>%
+  mutate(BirthYear = as.integer(stringr::str_sub(Participant, 4, 7)),
+         Age = 2019 - BirthYear,
+         Gender = stringr::str_sub(Participant, 8, 8),
+         Valid = MinTotal>=30 & MedianPcapture > 0.1)
+
+data_counts
+
+valid_participants <- 
+  data_counts %>%
+  filter(MinTotal>=30, MedianPcapture > 0.1) %>%
+  pull(Participant)
+
+dual_reports <-
+  all_dual_reports %>%
+  filter(Participant %in% valid_participants) %>%
+  ungroup() %>%
+  mutate(Condition = factor(Condition),
+         Condition = fct_relevel(Condition, "biased-switch", "ambiguous-switch")) 
+
+data_counts
+
+reports %>%
+  filter(Participant == "DEK2001WRNO") %>%
+  group_by(Session, Block) %>%
+  count()
+```
+
+
+## Plotting group averages for each condition
+
+```{r group averages}
+pcapture <- function(data, indices){
+  data %>%
+    group_by(Participant) %>%
+    summarise(Pcapture = mean(sample(IsCaptured, replace = TRUE)), na.rm=TRUE) %>%
+    ungroup() %>%
+    summarize(Pcapture = mean(Pcapture, na.rm=TRUE)) %>%
+    pull(Pcapture)
+}
+
+resample_pcapture <- function(df, R=2000){
+  observed_mean <-   
+    df %>%
+    group_by(Participant) %>%
+    summarise(Pcapture = mean(IsCaptured, na.rm=TRUE)) %>%
+    ungroup() %>%
+    summarize(Pcapture = mean(Pcapture, na.rm=TRUE)) %>%
+    pull(Pcapture)
+
+  
+  resampled <- boot(data=df, statistic = pcapture, R)
+  CIs <- boot.ci(resampled, type = "perc")
+  tibble(bootMean = observed_mean, 
+                bootLower = CIs$percent[4],
+                bootUpper = CIs$percent[5])
+}
+
+soa_effect <-
+  dual_reports %>%
+  filter(ProbeSOA %in% c(-300, -200, -100, -50, 0, 50, 100, 200, 300, 400)) %>%
+  group_by(ProbeSOA, Condition) %>%
+  do(resample_pcapture(., 20))
+            
+
+ggplot(soa_effect, # %>% filter(Condition != "ambiguous-stable"), 
+       aes(x= ProbeSOA, y=bootMean, color=Condition, fill=Condition)) + 
+  geom_hline(yintercept = 0.5, color="black") + 
+  geom_vline(xintercept = 0, color="black") + 
+  geom_line() + 
+  geom_errorbar(aes(ymin=bootLower, ymax=bootUpper), width=10) + 
+  geom_point(aes(shape=Condition)) +
+  theme(legend.position = c(0.15, 0.85), panel.grid.minor = element_blank()) +
+  scale_x_continuous("Probe onset relative to trigger event (ms)", breaks = unique(as.integer(soa_effect$ProbeSOA))) + 
+  scale_color_manual(values = three_colors) +
+  scale_fill_manual(values = three_colors) +
+  scale_shape_manual(values = c(21, 22, 23)) +
+  theme_ba() +
+  ylab("P(probe = bias)")
+
+ggsave("experiment3-group.pdf", units="cm", device=cairo_pdf, width=12, height=8)
+ggsave("experiment3-group.png", units="cm", width=20, height=15)
+```
+
+```{r}
+soa_effect_per_participant <-
+  dual_reports %>%
+  group_by(Participant, ProbeSOA, Condition) %>%
+  summarise(Ncaptured= sum(IsCaptured), 
+            Ntotal = n(),
+            Pcapture = Ncaptured/Ntotal, 
+            LowerCI = binom.bayes(Ncaptured, Ntotal)$lower,
+            UpperCI = binom.bayes(Ncaptured, Ntotal)$upper) %>%
+  
+  # integer indexes for stan
+  ungroup() %>%
+  mutate(Participant = factor(Participant),
+         iParticipant = as.integer(Participant), 
+         iCondition = as.integer(Condition))
+
+stan_conditions <-
+  soa_effect_per_participant %>%
+  filter(Condition != "ambiguous-stable")
+```
+
+## Fitting data assuming exponential decay after each event
+
+Data in stan format
+```{r}
+stan_data <- list(rowN = nrow(stan_conditions),
+                  participantsN = max(stan_conditions$iParticipant),
+                  conditionsN = max(stan_conditions$iCondition),
+                  
+                  ProbeOnset = stan_conditions$ProbeSOA,
+                  Ntotal = stan_conditions$Ntotal,
+                  Ncaptured = stan_conditions$Ncaptured,
+                  condition = stan_conditions$iCondition,
+                  participant = stan_conditions$iParticipant,
+                  
+                  conditionLevels = levels(stan_conditions$Condition),
+                  participantLevels = levels(stan_conditions$Participant))
+```
+
+## Stan models
+
+### Independent switch decay and delay per condition
+
+```{stan output.var="independent_decay_independent_delay_model"}
+data{
+  int<lower=1> rowN;            // number of data points
+  int<lower=1> participantsN;   // number of participants
+  int<lower=1> conditionsN;     // number of participants
+  
+  real ProbeOnset[rowN];                  // onset time
+  int<lower=1,upper=conditionsN> condition[rowN];  // conditions
+  int<lower=1,upper=participantsN> participant[rowN]; // participant
+  int<lower=1> Ntotal[rowN];          // number of trials per point
+  int<lower=0> Ncaptured[rowN];   // number of trials with probe capture
+}
+parameters {
+  // decay of probe sensitivity after the onset
+  real<lower=0> ProbeDecay_My;
+  real<lower=0> ProbeDecay_Sigma;
+  vector<lower=0>[participantsN] ProbeDecay;       
+  
+  // delay of the switch/bias following the trigger
+  vector[conditionsN] BiasOnset_Mu;
+  vector<lower=0>[conditionsN] BiasOnset_Sigma;
+  vector[participantsN] BiasOnset[conditionsN];
+
+  // decay of transient switch-induced bias
+  vector<lower=0>[conditionsN] BiasDecay_Mu;
+  vector<lower=0>[conditionsN] BiasDecay_Sigma;
+  vector<lower=0>[participantsN] BiasDecay[conditionsN]; 
+
+  // alpha intercept
+  real alpha_Mu;
+  real<lower=0> alpha_Sigma;
+  vector[participantsN] alpha;              
+  
+  // participant-specific beta for probability scaling
+  vector[participantsN] beta[conditionsN];
+  vector[conditionsN] beta_Mu;
+  vector<lower=0>[conditionsN] beta_Sigma;
+}
+transformed parameters{
+  vector[rowN] Pcaptured;
+  
+  for (irow in 1:rowN) {
+    real Tlaterevent = fmax(BiasOnset[condition[irow]][participant[irow]], ProbeOnset[irow]);
+
+    Pcaptured[irow] = alpha[participant[irow]] + beta[condition[irow]][participant[irow]] * exp(-(Tlaterevent-BiasOnset[condition[irow]][participant[irow]])/BiasDecay[condition[irow]][participant[irow]] - (Tlaterevent-ProbeOnset[irow])/ProbeDecay[participant[irow]]);
+  }
+}
+model {
+  // priors
+  ProbeDecay_My ~ cauchy(100, 50);
+  ProbeDecay_Sigma ~ cauchy(0, 10);
+  ProbeDecay ~ normal(ProbeDecay_My, ProbeDecay_Sigma);
+  
+  BiasOnset_Mu ~ cauchy(50, 50);
+  BiasOnset_Sigma ~ cauchy(0, 10);
+
+  BiasDecay_Mu ~ cauchy(100, 50);
+  BiasDecay_Sigma ~ cauchy(0, 10);
+  
+  alpha_Mu ~ cauchy(0, 10);
+  alpha_Sigma ~ cauchy(0, 10);
+  alpha ~ normal(alpha_Mu, alpha_Sigma);
+    
+  beta_Mu ~ cauchy(0, 10);
+  beta_Sigma ~ cauchy(0, 10);
+
+  // condition-specific components
+  for(iC in 1:conditionsN){
+    beta[iC] ~ normal(beta_Mu[iC], beta_Sigma[iC]);
+    BiasOnset[iC] ~ normal(BiasOnset_Mu[iC], BiasOnset_Sigma[iC]);
+    BiasDecay[iC] ~ normal(BiasDecay_Mu[iC], BiasDecay_Sigma[iC]);
+  }
+
+  Ncaptured ~ binomial_logit(Ntotal, Pcaptured);
+}
+generated quantities {
+  vector[rowN] log_lik;
+  for(irow in 1:rowN){
+    log_lik[irow]= binomial_logit_lpmf(Ncaptured[irow] | Ntotal[irow], Pcaptured[irow]);
+  }
+}
+```
+
+### Common delay
+
+```{stan output.var="independent_decay_common_delay_model"}
+data{
+  int<lower=1> rowN;            // number of data points
+  int<lower=1> participantsN;   // number of participants
+  int<lower=1> conditionsN;     // number of participants
+  
+  real ProbeOnset[rowN];                  // onset time
+  int<lower=1,upper=conditionsN> condition[rowN];  // conditions
+  int<lower=1,upper=participantsN> participant[rowN]; // participant
+  int<lower=1> Ntotal[rowN];          // number of trials per point
+  int<lower=0> Ncaptured[rowN];   // number of trials with probe capture
+}
+parameters {
+  // decay of probe sensitivity after the onset
+  real<lower=0> ProbeDecay_My;
+  real<lower=0> ProbeDecay_Sigma;
+  vector<lower=0>[participantsN] ProbeDecay;       
+  
+  // delay of the switch/bias following the trigger
+  real BiasOnset_Mu;
+  real<lower=0> BiasOnset_Sigma;
+  vector[participantsN] BiasOnset;
+
+  // decay of transient switch-induced bias
+  vector<lower=0>[conditionsN] BiasDecay_Mu;
+  vector<lower=0>[conditionsN] BiasDecay_Sigma;
+  vector<lower=0>[participantsN] BiasDecay[conditionsN]; 
+
+  // alpha intercept
+  real alpha_Mu;
+  real<lower=0> alpha_Sigma;
+  vector[participantsN] alpha;              
+  
+  // participant-specific beta for probability scaling
+  vector[participantsN] beta[conditionsN];
+  vector[conditionsN] beta_Mu;
+  vector<lower=0>[conditionsN] beta_Sigma;
+}
+transformed parameters{
+  vector[rowN] Pcaptured;
+  
+  for (irow in 1:rowN) {
+    real Tlaterevent = fmax(BiasOnset[participant[irow]], ProbeOnset[irow]);
+
+    Pcaptured[irow] = alpha[participant[irow]] + beta[condition[irow]][participant[irow]] * exp(-(Tlaterevent-BiasOnset[participant[irow]])/BiasDecay[condition[irow]][participant[irow]] - (Tlaterevent-ProbeOnset[irow])/ProbeDecay[participant[irow]]);
+  }
+}
+model {
+  // priors
+  ProbeDecay_My ~ cauchy(100, 50);
+  ProbeDecay_Sigma ~ cauchy(0, 10);
+  ProbeDecay ~ normal(ProbeDecay_My, ProbeDecay_Sigma);
+  
+  BiasOnset_Mu ~ cauchy(50, 50);
+  BiasOnset_Sigma ~ cauchy(0, 10);
+  BiasOnset ~ normal(BiasOnset_Mu, BiasOnset_Sigma);
+  
+  BiasDecay_Mu ~ cauchy(100, 50);
+  BiasDecay_Sigma ~ cauchy(0, 10);
+  
+  alpha_Mu ~ cauchy(0, 10);
+  alpha_Sigma ~ cauchy(0, 10);
+  alpha ~ normal(alpha_Mu, alpha_Sigma);
+    
+  beta_Mu ~ cauchy(0, 10);
+  beta_Sigma ~ cauchy(0, 10);
+
+  // condition-specific components
+  for(iC in 1:conditionsN){
+    beta[iC] ~ normal(beta_Mu[iC], beta_Sigma[iC]);
+    
+    BiasDecay[iC] ~ normal(BiasDecay_Mu[iC], BiasDecay_Sigma[iC]);
+  }
+
+  Ncaptured ~ binomial_logit(Ntotal, Pcaptured);
+}
+generated quantities {
+  vector[rowN] log_lik;
+  for(irow in 1:rowN){
+    log_lik[irow]= binomial_logit_lpmf(Ncaptured[irow] | Ntotal[irow], Pcaptured[irow]);
+  }
+}
+```
+
+### Common decay
+
+```{stan output.var="common_decay_independent_delay_model"}
+data{
+  int<lower=1> rowN;            // number of data points
+  int<lower=1> participantsN;   // number of participants
+  int<lower=1> conditionsN;     // number of participants
+  
+  real ProbeOnset[rowN];                  // onset time
+  int<lower=1,upper=conditionsN> condition[rowN];  // conditions
+  int<lower=1,upper=participantsN> participant[rowN]; // participant
+  int<lower=1> Ntotal[rowN];          // number of trials per point
+  int<lower=0> Ncaptured[rowN];   // number of trials with probe capture
+}
+parameters {
+  // decay of probe sensitivity after the onset
+  real<lower=0> ProbeDecay_My;
+  real<lower=0> ProbeDecay_Sigma;
+  vector<lower=0>[participantsN] ProbeDecay;       
+  
+  // delay of the switch/bias following the trigger
+  vector[conditionsN] BiasOnset_Mu;
+  vector<lower=0>[conditionsN] BiasOnset_Sigma;
+  vector[participantsN] BiasOnset[conditionsN];
+
+  // decay of transient switch-induced bias
+  real<lower=0> BiasDecay_Mu;
+  real<lower=0> BiasDecay_Sigma;
+  vector<lower=0>[participantsN] BiasDecay; 
+
+  // alpha intercept
+  real alpha_Mu;
+  real<lower=0> alpha_Sigma;
+  vector[participantsN] alpha;              
+  
+  // participant-specific beta for probability scaling
+  vector[participantsN] beta[conditionsN];
+  vector[conditionsN] beta_Mu;
+  vector<lower=0>[conditionsN] beta_Sigma;
+}
+transformed parameters{
+  vector[rowN] Pcaptured;
+  
+  for (irow in 1:rowN) {
+    real Tlaterevent = fmax(BiasOnset[condition[irow]][participant[irow]], ProbeOnset[irow]);
+
+    Pcaptured[irow] = alpha[participant[irow]] + beta[condition[irow]][participant[irow]] * exp(-(Tlaterevent-BiasOnset[condition[irow]][participant[irow]])/BiasDecay[participant[irow]] - (Tlaterevent-ProbeOnset[irow])/ProbeDecay[participant[irow]]);
+  }
+}
+model {
+  // priors
+  ProbeDecay_My ~ cauchy(100, 50);
+  ProbeDecay_Sigma ~ cauchy(0, 10);
+  ProbeDecay ~ normal(ProbeDecay_My, ProbeDecay_Sigma);
+  
+  BiasOnset_Mu ~ cauchy(50, 50);
+  BiasOnset_Sigma ~ cauchy(0, 10);
+
+  BiasDecay_Mu ~ cauchy(100, 50);
+  BiasDecay_Sigma ~ cauchy(0, 10);
+  BiasDecay ~ normal(BiasDecay_Mu, BiasDecay_Sigma);
+  
+  alpha_Mu ~ cauchy(0, 10);
+  alpha_Sigma ~ cauchy(0, 10);
+  alpha ~ normal(alpha_Mu, alpha_Sigma);
+    
+  beta_Mu ~ cauchy(0, 10);
+  beta_Sigma ~ cauchy(0, 10);
+
+  // condition-specific components
+  for(iC in 1:conditionsN){
+    beta[iC] ~ normal(beta_Mu[iC], beta_Sigma[iC]);
+    BiasOnset[iC] ~ normal(BiasOnset_Mu[iC], BiasOnset_Sigma[iC]);
+  }
+
+  Ncaptured ~ binomial_logit(Ntotal, Pcaptured);
+}
+generated quantities {
+  vector[rowN] log_lik;
+  for(irow in 1:rowN){
+    log_lik[irow]= binomial_logit_lpmf(Ncaptured[irow] | Ntotal[irow], Pcaptured[irow]);
+  }
+}
+```
+
+### Common decay
+
+```{stan output.var="common_decay_common_delay_model"}
+data{
+  int<lower=1> rowN;            // number of data points
+  int<lower=1> participantsN;   // number of participants
+  int<lower=1> conditionsN;     // number of participants
+  
+  real ProbeOnset[rowN];                  // onset time
+  int<lower=1,upper=conditionsN> condition[rowN];  // conditions
+  int<lower=1,upper=participantsN> participant[rowN]; // participant
+  int<lower=1> Ntotal[rowN];          // number of trials per point
+  int<lower=0> Ncaptured[rowN];   // number of trials with probe capture
+}
+parameters {
+  // decay of probe sensitivity after the onset
+  real<lower=0> ProbeDecay_My;
+  real<lower=0> ProbeDecay_Sigma;
+  vector<lower=0>[participantsN] ProbeDecay;       
+  
+  // delay of the switch/bias following the trigger
+  real BiasOnset_Mu;
+  real<lower=0> BiasOnset_Sigma;
+  vector[participantsN] BiasOnset;
+
+  // decay of transient switch-induced bias
+  real<lower=0> BiasDecay_Mu;
+  real<lower=0> BiasDecay_Sigma;
+  vector<lower=0>[participantsN] BiasDecay; 
+
+  // alpha intercept
+  real alpha_Mu;
+  real<lower=0> alpha_Sigma;
+  vector[participantsN] alpha;              
+  
+  // participant-specific beta for probability scaling
+  vector[participantsN] beta[conditionsN];
+  vector[conditionsN] beta_Mu;
+  vector<lower=0>[conditionsN] beta_Sigma;
+}
+transformed parameters{
+  vector[rowN] Pcaptured;
+  
+  for (irow in 1:rowN) {
+    real Tlaterevent = fmax(BiasOnset[participant[irow]], ProbeOnset[irow]);
+
+    Pcaptured[irow] = alpha[participant[irow]] + beta[condition[irow]][participant[irow]] * exp(-(Tlaterevent-BiasOnset[participant[irow]])/BiasDecay[participant[irow]] - (Tlaterevent-ProbeOnset[irow])/ProbeDecay[participant[irow]]);
+  }
+}
+model {
+  // priors
+  ProbeDecay_My ~ cauchy(100, 50);
+  ProbeDecay_Sigma ~ cauchy(0, 10);
+  ProbeDecay ~ normal(ProbeDecay_My, ProbeDecay_Sigma);
+  
+  BiasOnset_Mu ~ cauchy(50, 50);
+  BiasOnset_Sigma ~ cauchy(0, 10);
+  BiasOnset ~ normal(BiasOnset_Mu, BiasOnset_Sigma);
+
+  BiasDecay_Mu ~ cauchy(100, 50);
+  BiasDecay_Sigma ~ cauchy(0, 10);
+  BiasDecay ~ normal(BiasDecay_Mu, BiasDecay_Sigma);
+  
+  alpha_Mu ~ cauchy(0, 10);
+  alpha_Sigma ~ cauchy(0, 10);
+  alpha ~ normal(alpha_Mu, alpha_Sigma);
+    
+  beta_Mu ~ cauchy(0, 10);
+  beta_Sigma ~ cauchy(0, 10);
+
+  // condition-specific components
+  for(iC in 1:conditionsN){
+    beta[iC] ~ normal(beta_Mu[iC], beta_Sigma[iC]);
+  }
+
+  Ncaptured ~ binomial_logit(Ntotal, Pcaptured);
+}
+generated quantities {
+  vector[rowN] log_lik;
+  for(irow in 1:rowN){
+    log_lik[irow]= binomial_logit_lpmf(Ncaptured[irow] | Ntotal[irow], Pcaptured[irow]);
+  }
+}
+```
+
+
+
+```{r fitting the model}
+fits <- tibble(name = c("independent decay independent delay", 
+                        "common decay independent delay",
+                        "independent decay common delay",
+                        "common decay common delay"),
+              model = list(independent_decay_independent_delay_model,
+                            common_decay_independent_delay_model,
+                            independent_decay_common_delay_model,
+                            independent_decay_common_delay_model))
+
+fit_and_save <- function(stan_model, model_name){
+  fit <- rstan::sampling(stan_model,
+                         chains = 4,
+                         iter = 4000,
+                         control = list(adapt_delta = 0.98, max_treedepth=15),
+                         cores = future::availableCores(),
+                         data = stan_data)
+  save(fit, stan_data, stan_conditions, file=stringr::str_c("fit3-", model_name, ".RData"))
+  
+  fit
+}
+
+# fitting each model
+fits <- 
+  fits %>%
+  group_by(name) %>%
+  mutate(fit = purrr::map2(model, name, ~fit_and_save(.x, .y)))
+
+save(fits, stan_data, stan_conditions, file="fit-all3.RData")
+```
+
+# Adding loo criterion
+
+```{r}
+fits <-
+  fits %>%
+  mutate(log_lik = purrr::map(fit, ~extract_log_lik(., merge_chains = FALSE)),
+         waic = purrr::map(log_lik, ~loo::waic(.)),
+         r_eff = purrr::map(log_lik, ~relative_eff(exp(.))),
+         loo = purrr::map2(log_lik, r_eff, ~loo(.x, r_eff=.y)),
+         bridge = purrr::map(fit, ~ bridge_sampler(., silent = TRUE)))
+
+
+save(fits, stan_data, stan_conditions, file="fit-all-with-loo3.RData")
+```
+
+```{r}
+load("fit-all-with-loo3.RData")
+```
+
+```{r}
+fit_loos <- fits$loo
+names(fit_loos) <- fits$name
+loo::loo_compare(fit_loos) %>%
+  data.frame() %>%
+  select(elpd_diff, se_diff) %>%
+  rownames_to_column("Term") %>%
+  mutate_if(is.numeric, round, digits=2)
+```
+
+```{R}
+loo::loo_model_weights(fit_loos, method="stacking", r_eff_list = fits$r_eff)
+```
+
+```{r}
+fit_waics <- fits$waic
+names(fit_waics) <- fits$name
+loo::loo_compare(fit_waics) %>%
+  data.frame() %>%
+  rownames_to_column("Model") %>%
+  select(Model, elpd_diff, se_diff)
+```
+
+
+```{r}
+fit_bridges <- fits$bridge
+names(fit_bridges) <- fits$name
+
+bf_for_models <- function(m1, m2){
+  tibble(FirstModel = fits$name[m1],
+         SecondModel = fits$name[m2],
+         BF = bf(fit_bridges[[m1]], fit_bridges[[m2]])$bf)  
+}
+
+expand.grid(m1=1:nrow(fits), m2=1:nrow(fits)) %>%
+  rowwise() %>%
+  do(bf_for_models(.$m1[1], .$m2[1])) %>%
+  pivot_wider(names_from = SecondModel, values_from = BF) %>%
+  rename(`First Model`=FirstModel, "idid"=2, "cdid"=3, "idcd"=4, "cdcd"=5) %>%
+  mutate_if(is.numeric, round, digits=1) %>%
+  knitr::kable()
+
+
+```
+
+
+```{r}
+independent_decay_samples <- rstan::extract(fits$fit[[1]])
+f_onset_switch_fit <- function(t, ProbeDecay, BiasOnset, BiasDecay, alpha, beta){
+  Tlaterevent <- pmax(BiasOnset, t)
+
+  p <- inv.logit(alpha + beta * exp(-(Tlaterevent-BiasOnset)/BiasDecay) * exp(-(Tlaterevent-t)/ProbeDecay))
+  tibble(t = t, p= p)
+}
+
+
+predict_independent_decay_switch <- function(samples, iC, iP){
+  tibble(t = -300:400) %>%
+    group_by(t) %>%
+    do( f_onset_switch_fit(.$t[1], 
+                            samples$ProbeDecay[, iP], 
+                            samples$BiasOnset[, iC, iP], 
+                            samples$BiasDecay[, iC, iP], 
+                            samples$alpha[, iP], 
+                            samples$beta[, iC, iP])) %>%
+    summarize(pMean = mean(p), 
+              pLower = quantile(p, probs = 0.025),
+              pUpper = quantile(p, probs = 0.975)) %>%
+    ungroup() %>%
+    mutate(iCondition = iC,
+           iParticipant  = iP)
+}
+
+
+predictions <- 
+  expand_grid(iCondition = unique(stan_conditions$iCondition), 
+              iParticipant = 1:length(unique(stan_conditions$iParticipant))) %>%
+  group_by(iCondition, iParticipant) %>%
+  do(predict_independent_decay_switch(independent_decay_samples, .$iCondition[1], .$iParticipant[1])) %>%
+  ungroup() %>%
+  mutate(Participant = factor(iParticipant, labels = levels(as.factor(stan_conditions$Participant))))
+
+
+ggplot(predictions, aes(x=t, y=pMean, ymin=pLower, ymax=pUpper, color=as.factor(iCondition), fill=as.factor(iCondition), shape=as.factor(iCondition))) + 
+  geom_ribbon(alpha = 0.25, color=NA) + 
+  geom_line() +
+  facet_wrap(Participant ~ ., ncol=4) +
+  geom_errorbar(data = stan_conditions, aes(x= ProbeSOA, y=Pcapture, ymin=LowerCI, ymax=UpperCI, color=as.factor(iCondition)), width=20) + 
+  geom_point(data = stan_conditions, aes(x= ProbeSOA, y=Pcapture, ymin=LowerCI, ymax=UpperCI, color=as.factor(iCondition)), size=0.5)+
+  theme(legend.position = "none", panel.grid.minor = element_blank(), strip.background = element_blank(), strip.text = element_blank()) +
+  scale_x_continuous(name="Probe onset relative to trigger event (ms)", breaks = seq(-200, 400, 200)) +
+  scale_y_continuous(name="P(probe == bias)", breaks = seq(0, 1, 0.2)) +
+  # scale_color_manual(values=three_colors) +
+  # scale_fill_manual(values=three_light_colors) +
+  scale_shape_manual(values=c(21, 22)) + 
+  theme_ba()
+
+ggsave("experiment3-fits.pdf", units="cm", device=cairo_pdf, width=12, height=8)
+```
+
+```{r}
+summary(independent_decay_samples$BiasOnset_Mu[, 2])
+quantile(independent_decay_samples$BiasOnset_Mu[, 2], c(0.025, 0.975))
+```
+
+
+```{r}
+ggplot() + 
+  geom_histogram(aes(x=independent_decay_samples$ProbeDecay_My), bins=100) + 
+  xlab("Onset")
+
+decay_constants <- bind_rows(tibble(Condition = levels(stan_conditions$Condition)[1], Tau = independent_decay_samples$BiasDecay_Mu[, 1]),
+                             tibble(Condition = levels(stan_conditions$Condition)[2], Tau = independent_decay_samples$BiasDecay_Mu[, 2])) %>%
+  ungroup() %>%
+  mutate(Condition = factor(Condition, levels= stan_data$conditionLevels))
+
+decay_plot <- 
+  ggplot(decay_constants, aes(x= Tau, fill=Condition)) +
+  geom_histogram(position="identity", bins=100, alpha=0.5) + 
+  ylab("Count") +
+  xlab("Bias decay (ms)") +
+  theme_ba() + 
+  theme(legend.position = "none")
+
+switch_delay <- bind_rows(tibble(Condition = levels(stan_conditions$Condition)[1], `Bias onset (ms)` = independent_decay_samples$BiasOnset_Mu[, 1]),
+                          tibble(Condition = levels(stan_conditions$Condition)[2], `Bias onset (ms)` = independent_decay_samples$BiasOnset_Mu[, 2])) %>%
+  ungroup() %>%
+  mutate(Condition = factor(Condition, levels= stan_data$conditionLevels))
+
+delay_plot <-  
+  ggplot(switch_delay, aes(x= `Bias onset (ms)`, fill=Condition)) +
+  geom_histogram(position="identity", bins=100, alpha=0.5) + 
+  ylab("Count")+
+  theme_ba() + 
+  theme(legend.position = "none")
+
+onset_decay <- tibble(Label = "Probe onset", Tau = independent_decay_samples$ProbeDecay_My)
+
+onset_plot <-
+  ggplot(onset_decay, aes(x=Tau)) + 
+  geom_histogram(position="identity", bins=100) + 
+  ylab("Count")+
+  xlab("Probe decay (ms)") +
+  theme_ba() + 
+  theme(legend.position = "none")
+
+dDecay <- independent_decay_samples$BiasDecay_Mu[, 2]-independent_decay_samples$BiasDecay_Mu[, 1]
+decay_diff_plot <-
+  ggplot() + 
+  geom_histogram(aes(x=dDecay), bins=100) +
+  geom_vline(xintercept = 0, color="red") +
+  geom_text(aes(x=-Inf, y=Inf), label=glue::glue(">0: {round(100*mean(dDecay>0))}%"), hjust="left", vjust="top")+
+  xlab("Difference in decay times") +
+  theme_ba()
+
+dOnset <- independent_decay_samples$BiasOnset_Mu[, 2]-independent_decay_samples$BiasOnset_Mu[, 1]
+onset_diff_plot <- 
+  ggplot() + 
+  geom_histogram(aes(x=dOnset), bins=100) +
+  geom_vline(xintercept = 0, color="red") +
+  geom_text(aes(x=-Inf, y=Inf), label=glue::glue(">0: {round(100*mean(dOnset>0))}%"), hjust="left", vjust="top")+
+  xlab("Difference in onset times") + 
+  theme_ba()
+
+timeconstants_plot <- (decay_plot + delay_plot) / (decay_diff_plot + onset_diff_plot) / ( onset_plot +  onset_plot)
+timeconstants_plot
+ggsave(timeconstants_plot, filename="experiment3-betas.pdf", units="cm", device=cairo_pdf, width=12, height=12)
+```
+
+
